@@ -10,7 +10,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"gopkg.in/mgo.v2"
@@ -19,10 +18,7 @@ import (
 	"github.com/spf13/cobra"
 )
 
-const (
-	treeCol  = "trees"
-	assetCol = "private-assets"
-)
+const assetCol = "private-assets"
 
 var servers []string
 var dbName string
@@ -41,26 +37,18 @@ var user string
 var pass string
 var container string
 var internal bool
+var single bool
 
-var treesCompleted int64
-var treesTotal int
+var objectsCompleted int64
+var objectsTotal int64
+
 var broken []busted
 var brokenLock sync.Mutex
 var checked = make(map[string]bool)
 
-type tree struct {
-	ID      string `bson:"_id"`
-	Entries map[string]entry
-}
-
-type entry struct {
-	Digest string `bson:"d"`
-	Size   int    `bson:"s"`
-	Type   string `bson:"t"`
-}
-
 type busted struct {
-	TreeID string
+	Type   string
+	ID     string
 	Digest string
 }
 
@@ -71,94 +59,58 @@ func main() {
 }
 
 func rootCmd() *cobra.Command {
-	root := &cobra.Command{
-		Run: run,
-	}
+	root := &cobra.Command{}
 
-	root.Flags().StringSliceVarP(&servers, "server", "s", []string{"mongo.lo"}, "which mongo instance to connect to")
-	root.Flags().StringSliceVar(&caFiles, "ca", []string{"/etc/cfssl/certs/ca.pem"}, "a ca file to use")
-	root.Flags().StringVar(&certFile, "cert", "/etc/cfssl/certs/cert.pem", "a cert file to use")
-	root.Flags().StringVar(&keyFile, "key", "/etc/cfssl/certs/cert-key.pem", "a key file to use")
-	root.Flags().StringVar(&dbName, "db", "bitballoon", "the name of the db to use")
-	root.Flags().StringVarP(&user, "user", "u", "netlify", "the name of the user to use for cloudfiles")
-	root.Flags().StringVarP(&pass, "pass", "p", "", "the name of the password to use for cloudfiles")
-	root.Flags().StringVarP(&region, "region", "r", "ORD", "the region to use for cloudfiles")
-	root.Flags().StringVarP(&container, "container", "c", "private", "the region to use for cloudfiles")
-	root.Flags().BoolVar(&internal, "internal", false, "if the cloud files connection is internal")
-	root.Flags().StringVarP(&sinceStr, "since", "t", "20h", "a since time in the format of #[m | h | s | d]")
-	root.Flags().BoolVar(&useTLS, "tls", false, "if we should use tls")
-	root.Flags().BoolVarP(&verbose, "verbose", "v", false, "if we should use tls")
-	root.Flags().IntVarP(&numWorkers, "workers", "w", 100, "the number of workers to start")
+	root.PersistentFlags().StringSliceVarP(&servers, "server", "s", []string{"mongo.lo"}, "which mongo instance to connect to")
+	root.PersistentFlags().StringSliceVar(&caFiles, "ca", []string{"/etc/cfssl/certs/ca.pem"}, "a ca file to use")
+	root.PersistentFlags().StringVar(&certFile, "cert", "/etc/cfssl/certs/cert.pem", "a cert file to use")
+	root.PersistentFlags().StringVar(&keyFile, "key", "/etc/cfssl/certs/cert-key.pem", "a key file to use")
+	root.PersistentFlags().StringVar(&dbName, "db", "bitballoon", "the name of the db to use")
+	root.PersistentFlags().StringVarP(&user, "user", "u", "netlify", "the name of the user to use for cloudfiles")
+	root.PersistentFlags().StringVarP(&pass, "pass", "p", "", "the name of the password to use for cloudfiles")
+	root.PersistentFlags().StringVarP(&region, "region", "r", "ORD", "the region to use for cloudfiles")
+	root.PersistentFlags().StringVarP(&container, "container", "c", "private", "the region to use for cloudfiles")
+	root.PersistentFlags().BoolVar(&internal, "internal", false, "if the cloud files connection is internal")
+	root.PersistentFlags().StringVarP(&sinceStr, "since", "t", "20h", "a since time in the format of #[m | h | s | d]")
+	root.PersistentFlags().BoolVar(&useTLS, "tls", false, "if we should use tls")
+	root.PersistentFlags().BoolVarP(&verbose, "verbose", "v", false, "if we should use tls")
+	root.PersistentFlags().BoolVar(&single, "single", false, "if we should quit checking entries after a single failure in a tree")
+	root.PersistentFlags().IntVarP(&numWorkers, "workers", "w", 100, "the number of workers to start")
+
+	treeCmd := &cobra.Command{
+		Run: searchForTrees,
+		Use: "trees",
+	}
+	blobCmd := &cobra.Command{
+		Run: searchForBlobs,
+		Use: "blobs",
+	}
+	root.AddCommand(treeCmd, blobCmd)
 
 	return root
 }
 
-func run(cmd *cobra.Command, _ []string) {
-	var err error
-
-	since := parseSince()
-
-	log.Println("Connecting to mongo")
-	sess := connectToMongo()
-	db := sess.DB(dbName)
-	log.Println("Connected to mongo: " + dbName)
-
-	log.Println("Building cache store")
-	store = buildCacheStore(sess, db.C(assetCol))
-
-	work := make(chan *tree)
-	wg := sync.WaitGroup{}
-	log.Printf("Starting %d workers\n", numWorkers)
-	for i := numWorkers; i > 0; i-- {
-		wg.Add(1)
-		go consume(i, &wg, work)
+func printSummary() {
+	fmt.Printf("Discovered %d broken references\n", len(broken))
+	fmt.Println("index\ttype\tid\tsha")
+	for i, b := range broken {
+		fmt.Printf("%d\t%s\t%s\t%s\n", i, b.Type, b.ID, b.Digest)
 	}
-
-	log.Println("Going fetching all the tree objects since " + sinceStr + " ago (" + since.String() + ")")
-	treeQuery := db.C(treeCol).Find(bson.M{"created_at": bson.M{"$gt": since}})
-	treesTotal, err = treeQuery.Count()
-	if err != nil {
-		log.Fatal("Failed to find out how many trees we are going to process: " + err.Error())
-	}
-	log.Printf("Discovered %d trees that we need to check\n", treesTotal)
-
-	treeIter := treeQuery.Iter()
-	t := new(tree)
-	for treeIter.Next(t) {
-		work <- t
-		t = new(tree)
-	}
-	close(work)
-	log.Println("Finished enqueuing work - waiting for it to be completed")
-	wg.Wait()
 }
 
-func consume(id int, wg *sync.WaitGroup, work chan *tree) {
-	for t := range work {
-		debug("%d: starting to process tree: %s", id, t.ID)
+func queryForTotal(col *mgo.Collection) *mgo.Query {
+	since := parseSince()
 
-		for path, entry := range t.Entries {
-			if entry.Size == -1 || entry.Type == "f" || checked[entry.Digest] {
-				continue
-			}
-			checked[entry.Digest] = true
-
-			if !check(entry.Digest) {
-				b := busted{TreeID: t.ID, Digest: entry.Digest}
-				brokenLock.Lock()
-				broken = append(broken, b)
-				brokenLock.Unlock()
-
-				log.Printf("BROKEN FILE DISCOVERED: tree: %s, sha: %s, name: %s\n", t.ID, entry.Digest, path)
-			}
-		}
-		debug("%d: finished processing tree: %s", id, t.ID)
-		numDone := atomic.AddInt64(&treesCompleted, 1)
-		if numDone%100 == 0 {
-			log.Printf("Completed %d of %d\n", numDone, treesTotal)
-		}
+	// query for blobs
+	log.Println("Going fetching all the blob objects since " + sinceStr + " ago (" + since.String() + ")")
+	query := col.Find(bson.M{"created_at": bson.M{"$gt": since}})
+	total, err := query.Count()
+	if err != nil {
+		log.Fatal("Failed to find out how many objects we are going to process: " + err.Error())
 	}
-	wg.Done()
+	log.Printf("Discovered %d objects that we need to check\n", total)
+	objectsTotal = int64(total)
+	return query
 }
 
 func check(sha string) bool {
